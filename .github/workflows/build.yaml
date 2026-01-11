@@ -1,0 +1,167 @@
+name: Build and Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  APP_NAME: boku_no_key
+
+jobs:
+  build-with-cross:
+    name: Build with Cross
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            name: linux-gnu-amd64
+          - target: aarch64-unknown-linux-gnu
+            name: linux-gnu-arm64
+          - target: x86_64-pc-windows-gnu
+            name: windows-gnu-amd64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Create Cross.toml
+        run: |
+          cat <<EOF > Cross.toml
+          [target.x86_64-unknown-linux-gnu]
+          pre-build = ["apt-get update && apt-get install -y libpcsclite-dev pkg-config"]
+
+          [target.aarch64-unknown-linux-gnu]
+          pre-build = [
+            "dpkg --add-architecture arm64",
+            "apt-get update",
+            "apt-get install -y --no-install-recommends libpcsclite-dev:arm64 pkg-config"
+          ]
+          EOF
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cross-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build binary with cross
+        run: cross build --release --target ${{ matrix.target }} --verbose
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          ARTIFACT_DIR="target/${{ matrix.target }}/release"
+          
+          if [[ "${{ matrix.target }}" == *"-windows-"* ]]; then
+            SRC_FILE_NAME="${{ env.APP_NAME }}.exe"
+            ASSET_NAME="${{ env.APP_NAME }}-${{ matrix.name }}.zip"
+            7z a "${ASSET_NAME}" "./${ARTIFACT_DIR}/${SRC_FILE_NAME}"
+          else
+            SRC_FILE_NAME="${{ env.APP_NAME }}"
+            ASSET_NAME="${{ env.APP_NAME }}-${{ matrix.name }}.tar.gz"
+            tar -C "${ARTIFACT_DIR}" -czf "${ASSET_NAME}" "${SRC_FILE_NAME}"
+          fi
+          
+          echo "ASSET_PATH=${ASSET_NAME}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.name }}
+          path: ${{ env.ASSET_PATH }}
+
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            name: macos-amd64
+          - target: aarch64-apple-darwin
+            name: macos-arm64
+            
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ matrix.target }}
+          
+      - name: Build binary with cargo
+        run: cargo build --release --target ${{ matrix.target }} --verbose
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          ARTIFACT_DIR="target/${{ matrix.target }}/release"
+          ASSET_NAME="${{ env.APP_NAME }}-${{ matrix.name }}.tar.gz"
+          
+          tar -C "${ARTIFACT_DIR}" -czf "${ASSET_NAME}" "${{ env.APP_NAME }}"
+          
+          echo "ASSET_PATH=${ASSET_NAME}" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ matrix.name }}
+          path: ${{ env.ASSET_PATH }}
+
+  release:
+    name: Create GitHub Release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: [build-with-cross, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create download directory
+        run: mkdir downloads
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: downloads
+          pattern: ${{ env.APP_NAME }}-*
+      
+      - name: Upload assets to release
+        shell: bash
+        run: |
+          for file in downloads/*/*; do
+            echo "Uploading $file..."
+            gh release upload "${{ github.event.release.tag_name }}" "$file" --clobber
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

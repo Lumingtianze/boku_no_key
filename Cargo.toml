@@ -1,0 +1,27 @@
+[package]
+name = "boku_no_key"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "一个非官方的 Pico Key 配置与管理工具"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] }
+pcsc = "2.8"
+hex = "0.4"
+inquire = "0.7"
+byteorder = "1.5"
+anyhow = "1.0"
+colored = "2.0"
+
+[profile.release]
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = true
+
+[[bin]]
+name = "boku_no_key"
+path = "src/main.rs"
