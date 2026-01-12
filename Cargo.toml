@@ -1,6 +1,6 @@
 [package]
 name = "boku_no_key"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "AGPL-3.0-only"
 description = "一个非官方的 Pico Key 配置与管理工具"

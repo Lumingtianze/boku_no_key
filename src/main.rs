@@ -30,6 +30,7 @@ const TAG_LED_DRIVER: u8 = 0x0C;
 // Instructions
 const INS_MGMT_READ: u8 = 0x1D;
 const INS_RESCUE_WRITE_PHY: u8 = 0x1C;
+const INS_RESCUE_SECURE: u8 = 0x1D; 
 const INS_RESCUE_READ_INFO: u8 = 0x1E;
 
 // Bitmasks
@@ -49,7 +50,7 @@ const CURVE_SECP256K1: u32 = 0x08;
 const CURVE_ED25519: u32 = 0x80;
 
 #[derive(Parser)]
-#[command(name = "boku_no_key", version = "0.1.0", about = "一个非官方的 Pico Key 配置与管理工具")]
+#[command(name = "boku_no_key", version = "0.1.1", about = "一个非官方的 Pico Key 配置与管理工具")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -632,66 +633,99 @@ fn run_config_interactive(debug: bool) -> Result<()> {
             },
             "安全启动管理 (Secure Boot)" => {
                 println!("\n{}", "--- 安全启动管理 ---".bold().on_yellow().black());
-                println!("{} {}", "适用芯片:".bold(), "RP2350 (Pico 2), ESP32-S3".cyan());
+                println!("{} {}", "适用芯片:".bold(), "RP2350 (Pico 2)".cyan());
+                println!("{} {}", "不支持芯片:".bold(), "RP2040 (无硬件支持), ESP32-S3 (固件未实现)".red());
                 
-                println!("1. {}：不可逆操作。芯片启动时强制校验固件签名，无法再运行自编译的未签名固件。OTP/eFuse 寄存器仍处于可写状态。", "开启签名校验".yellow());
-                println!("2. {}：不可逆操作。禁用调试接口并设置 OTP/eFuse 寄存器为只读。", "永久锁定硬件".red());
+                println!("1. {}：不可逆操作。芯片启动时强制校验固件签名，无法再运行自编译的未签名固件。OTP 寄存器仍处于可写状态。", "开启签名校验".yellow());
+                println!("2. {}：不可逆操作。禁用调试接口并设置 OTP 寄存器为只读。", "永久锁定硬件".red());
 
-                let (sb_data, sb_sw) = dev.transmit(&[0x80, INS_RESCUE_READ_INFO, 0x03, 0x00, 0x00])?;
+                // 尝试读取 Secure Boot 信息
+                // 使用 INS_RESCUE_READ_INFO (0x1E)
+                // v7.0 以前的固件不支持此指令，会返回 Error SW
+                let (sb_data, sb_sw) = dev.transmit(&[0x80, INS_RESCUE_READ_INFO, 0x03, 0x00, 0x00])
+                    .unwrap_or((vec![], 0x0000));
+
+                let mut is_unknown = false;
+                let mut enabled = false;
+                let mut locked = false;
+
                 if sb_sw == 0x9000 && sb_data.len() >= 2 {
-                    let enabled = sb_data[0] != 0;
-                    let locked = sb_data[1] != 0;
+                    enabled = sb_data[0] != 0;
+                    locked = sb_data[1] != 0;
                     
                     println!("\n当前硬件状态:");
                     println!(" - 签名校验: {}", if enabled { "【已开启】".green() } else { "【未开启】".yellow() });
                     println!(" - 硬件锁定: {}", if locked { "【已锁定】(调试禁用/只读)".red() } else { "【未锁定】(可调试/可写)".green() });
+                } else {
+                    is_unknown = true;
+                    println!("\n{}", format!("注意：无法读取状态 (SW={:04X})。", sb_sw).magenta());
+                    if sb_sw == 0x6D00 || sb_sw == 0x0000 {
+                        println!("当前芯片可能不支持安全启动，或您的固件版本 (如 v6.6) 可能不支持状态查询指令，但仍支持开启指令。");
+                    }
+                    println!("{}", "您已进入盲操作模式。即使无法确认当前状态，您仍可发送开启/锁定指令。".bold());
+                }
 
-                    if !locked {
-                        let mut options = vec!["返回主菜单"];
-                        // 只有未开启时才显示开启选项
-                        if !enabled {
-                            options.push("开启签名校验 (需输入指令确认)");
-                        }
-                        // 任何未锁定状态下都可以执行锁定
-                        options.push("执行永久硬件锁定 (需输入指令确认)");
+                if locked && !is_unknown {
+                    println!("\n{}", "设备已处于硬件锁定状态，无法再更改安全配置。".yellow());
+                } else {
+                    let mut options = vec!["返回主菜单"];
+                    // 状态未知 或 状态已知且未开启，都显示开启选项
+                    if is_unknown || !enabled {
+                        options.push("开启签名校验 (需输入指令确认)");
+                    }
+                    // 任何未锁定状态（或未知状态）下都可以执行锁定
+                    options.push("执行永久硬件锁定 (需输入指令确认)");
 
-                        let act = Select::new("请选择操作:", options).prompt()?;
-                        match act {
-                            "开启签名校验 (需输入指令确认)" => {
-                                println!("\n{}", "警告：即将烧断安全启动熔丝！".red().bold());
-                                println!("此操作后，如果刷入未签名的固件，设备将无法启动（变砖）。");
-                                println!("请输入 {} 以确认执行此操作：", "'ENABLE'".bold().yellow());
+                    let act = Select::new("请选择操作:", options).prompt()?;
+                    match act {
+                        "开启签名校验 (需输入指令确认)" => {
+                            println!("\n{}", "警告：即将烧断安全启动熔丝！".red().bold());
+                            println!("此操作后，如果刷入未签名的固件，设备将无法启动（变砖）。");
+                            if is_unknown {
+                                println!("{}", "注意：当前处于盲操作模式。如果设备之前已开启，此操作通常无害。".magenta());
+                            }
+                            println!("请输入 {} 以确认执行此操作：", "'ENABLE'".bold().yellow());
+                            
+                            let confirm = Text::new("确认指令:").prompt()?;
+                            if confirm == "ENABLE" {
+                                // 修正: 使用 INS_RESCUE_SECURE (0x1D)
+                                // P1=0x00 (Key Index), P2=0x00 (Lock=False)
+                                // Data=None (Le=00)
+                                let (_, sw_write) = dev.transmit(&[0x80, INS_RESCUE_SECURE, 0x00, 0x00, 0x00])?;
                                 
-                                let confirm = Text::new("确认指令:").prompt()?;
-                                if confirm == "ENABLE" {
-                                    // P1=0x02, Data=[KeyIdx=0, LockFlag=0]
-                                    dev.transmit(&[0x80, INS_RESCUE_WRITE_PHY, 0x02, 0x00, 0x02, 0x00, 0x00])?;
-                                    println!("{}", "操作成功：签名校验已开启。".green().bold());
+                                if sw_write == 0x9000 {
+                                    println!("{}", "操作成功：指令已发送。".green().bold());
+                                    println!("请重插拔设备以生效。");
                                 } else {
-                                    println!("输入不匹配，操作已取消。");
+                                    println!("{}", format!("操作失败：SW={:04X}", sw_write).red());
                                 }
-                            },
-                            "执行永久硬件锁定 (需输入指令确认)" => {
-                                println!("\n{}", "警告：即将永久锁定硬件！".on_red().white().bold());
-                                println!("此操作将烧断调试接口熔丝，并将 OTP/eFuse 设为只读。此过程绝对不可逆！");
-                                println!("请输入 {} 以确认执行最终锁定：", "'LOCK'".bold().red());
+                            } else {
+                                println!("输入不匹配，操作已取消。");
+                            }
+                        },
+                        "执行永久硬件锁定 (需输入指令确认)" => {
+                            println!("\n{}", "警告：即将永久锁定硬件！".on_red().white().bold());
+                            println!("此操作将烧断调试接口熔丝，并将 OTP 寄存器设为只读。此过程绝对不可逆！");
+                            println!("请输入 {} 以确认执行最终锁定：", "'LOCK'".bold().red());
+                            
+                            let confirm = Text::new("确认指令:").prompt()?;
+                            if confirm == "LOCK" {
+                                // 修正: 使用 INS_RESCUE_SECURE (0x1D)
+                                // P1=0x00 (Key Index), P2=0x01 (Lock=True)
+                                // Data=None (Le=00)
+                                let (_, sw_write) = dev.transmit(&[0x80, INS_RESCUE_SECURE, 0x00, 0x01, 0x00])?;
                                 
-                                let confirm = Text::new("确认指令:").prompt()?;
-                                if confirm == "LOCK" {
-                                    // P1=0x02, Data=[KeyIdx=0, LockFlag=1]
-                                    dev.transmit(&[0x80, INS_RESCUE_WRITE_PHY, 0x02, 0x00, 0x02, 0x00, 0x01])?;
+                                if sw_write == 0x9000 {
                                     println!("{}", "操作成功：设备已执行硬件锁定。".red().bold());
                                 } else {
-                                    println!("输入不匹配，操作已取消。");
+                                    println!("{}", format!("操作失败：SW={:04X}", sw_write).red());
                                 }
-                            },
-                            _ => {}
-                        }
-                    } else {
-                        println!("\n{}", "设备已处于硬件锁定状态，无法再更改安全配置。".yellow());
+                            } else {
+                                println!("输入不匹配，操作已取消。");
+                            }
+                        },
+                        _ => {}
                     }
-                } else {
-                    println!("\n{}", "读取状态失败：当前芯片可能不支持安全启动。".red());
                 }
             },
             "写入配置 (Apply)" => {
